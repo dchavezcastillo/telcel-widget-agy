@@ -31,7 +31,58 @@ Widgets para iOS que muestran en tiempo real los **GB disponibles combinados (Pl
 
 ---
 
+## Mi Telcel v2: actualización periódica con protección ante fallos de acceso
+
+Si ves `401`, datos antiguos o un bloqueo por intentos fallidos, usa **[`src/MiTelcelWidgetv2.js`](src/MiTelcelWidgetv2.js)**. Es un script nuevo e independiente; `MiTelcelWidget.js` se conserva como versión anterior.
+
+1. **Retira de la pantalla de inicio los widgets Telcel anteriores** y desactiva sus automatizaciones de Atajos. Si también usas la extensión nativa o el script Android con la misma cuenta, detén sus consultas durante la configuración. La v2 no puede detener los intentos de otros clientes.
+2. Espera a que termine el bloqueo indicado por Telcel; por precaución, deja pasar **30 minutos desde el último intento fallido**. No pulses Play repetidamente durante el bloqueo.
+3. Crea en Scriptable un script llamado **`MiTelcelWidgetv2`** y pega **todo** el contenido de [`src/MiTelcelWidgetv2.js`](src/MiTelcelWidgetv2.js). No pongas tu teléfono ni contraseña dentro del código.
+4. Ejecuta Play una vez, cuando tu cuenta esté desbloqueada. En **Configurar Mi Telcel v2.1.0**, introduce tu número y contraseña actuales, toca **Continuar** y luego **Listo** en la barra superior. La primera configuración vuelve a pedirlos y no utiliza silenciosamente la contraseña antigua del Keychain. Se valida y obtiene el consumo en una sola sesión, que se revoca antes de guardar las credenciales.
+5. Añade o edita el widget pequeño de Scriptable y selecciona explícitamente **`MiTelcelWidgetv2`** en el campo **Script**. El encabezado compacto muestra **Mi Telcel**. Elegir todavía `MiTelcel` en el campo Script ejecutaría el código anterior.
+
+La v2 conserva la gráfica bicolor, la suma Plan + Promo, el corte y el presupuesto diario. Solicita actualización cada **60 minutos** mediante `refreshAfterDate`; iOS decide cuándo ejecutarla y puede retrasarla. El código no se descarga ni se actualiza automáticamente: al instalar otra versión hay que reemplazar el contenido del script.
+
+- `CONFIG.refreshMinutes` permite cambiar el intervalo; se aplica un mínimo de 15 minutos. Se recomienda conservar 60 mientras verificas el acceso. Abrir el script o duplicar el widget no omite el intervalo persistido.
+- Si falla el login, hay un `400/401/403/423/429`, falta el token de consumo o no se confirma la revocación, **se pausa el acceso automático**. Pasados al menos 30 minutos, abre el script y elige **Revisar credenciales y reanudar**. La pausa no se elimina por sí sola al cumplirse ese tiempo.
+- Si falla la red después de autenticar y se confirma la revocación, se conserva la caché y se vuelve a intentar en un intervalo espaciado. Si iOS interrumpe la ejecución, la siguiente carga requiere revisión manual.
+- `☁️` indica datos guardados; **hace X min/h/d** muestra su antigüedad. Los días restantes se recalculan sin inventar consumos nuevos. **Acceso pausado** permite distinguir un fallo de autenticación de una gráfica actualizada.
+- La configuración pública Basic se busca en `/login` y sus scripts, con soporte para rutas relativas y distintas formas de declarar la clave. El respaldo estático no prueba que tu contraseña sea incorrecta. Los errores identifican la etapa: **SSO OIDC**, **Intercambio B2F**, **Consumo Home** o **Cierre SSO**.
+- Se usa **OIDC directamente**, con captura de redirección y comprobación de `state`. No se prueba WebLogin y luego OIDC en una misma consulta. `CONFIG.authMethod = "weblogin"` es una alternativa manual si cambia la compatibilidad del portal; espera el periodo de protección antes de probarla. No alternes métodos repetidamente.
+
+Las credenciales siguen exclusivamente en `TELCEL_PHONE` / `TELCEL_PASS` del Keychain. La caché y el estado de protección usan archivos nuevos `mitelcel_v2_*`, sin contraseñas ni tokens de sesión. No borres el estado para saltarte la pausa.
+
+Si aparecía **Configuración: Abre Scriptable y configura MiTelcelWidgetv2** o **0 dígitos detectados** después de escribir el número, la validación local no estaba recibiendo los campos del diálogo; no era un rechazo del operador. Desde **2.0.2**, se usa un formulario local en WebView, sin recursos ni conexiones externas. Lee los valores de los campos HTML y comprueba el número y la contraseña antes de continuar. Toca **Continuar** y después **Listo** en la barra superior; cerrar sin Continuar cancela sin iniciar sesión.
+
+**2.0.3 corrige el inicio del formulario:** la versión anterior bloqueaba todas las navegaciones antes de cargar su HTML, lo que podía impedir que apareciera la pantalla. Ahora carga primero el HTML local protegido por CSP y después bloquea conexiones externas, permitiendo la navegación local `about:blank`. El script espera explícitamente `await main()`; una carga o lectura que no responde muestra un error después de 10 segundos. La espera mientras escribes tus datos no tiene ese límite.
+
+**2.0.4 mejora el diseño del widget pequeño:** encabezado y píldora de días con ancho reservado, gráfica centrada y dos columnas del mismo tamaño para el consumo usado y el presupuesto diario. El porcentaje aparece debajo del consumo y el pie ocupa una sola línea. La nube `☁︎` indica caché; se muestra su edad desde una hora y se resalta en amarillo desde un día, o si el acceso está pausado. Se conserva la autenticación, la actualización periódica y el estado de protección. Para actualizar, reemplaza el código del script existente sin borrar sus credenciales ni archivos locales; si aparece el menú, puedes elegir Ver gráfica guardada.
+
+**2.0.5 explicita los días restantes:** la píldora superior derecha muestra **Quedan** y debajo **26 días** (según el consumo reportado), manteniendo el semáforo de proximidad al corte y el recálculo al leer caché.
+
+**2.0.6 corrige el recorte de los días:** las dos líneas de la píldora se dibujan juntas en un lienzo de tamaño fijo, con más ancho, para evitar que WidgetKit reparta el espacio entre stacks anidados y muestre puntos suspensivos.
+
+**2.1.0 añade alertas locales de consumo**, activadas por defecto, combinando uso real de Plan + Promo y días restantes confirmados:
+
+| Consumo usado | Días restantes mínimos para avisar |
+| --- | --- |
+| 80% o más | 7 días |
+| 90% o más | 3 días |
+| 95% o más | 2 días |
+
+Se elige el nivel más alto que cumpla ambas condiciones. Por ejemplo, 80% con 2 días no avisa; 95% con 2 días sí. Con 1 día o menos no se envían alertas automáticas. El aviso incluye porcentaje, días, GB disponibles y presupuesto diario; al tocarlo se abre el script.
+
+- **Evitar repeticiones:** como máximo un aviso por nivel y ciclo de corte, con al menos 24 horas entre avisos (hasta tres niveles por ciclo). Si el primer aviso ocurre en 95%, se omiten los inferiores. Un nuevo ciclo permite avisar de nuevo. Se tolera un día de variación del corte reportado para no duplicar avisos.
+- **Datos fiables:** se evalúa después de una consulta válida y del cierre SSO, con datos de hasta 15 minutos. No avisa con caché, fallos de red ni días estimados por el fallback de 28 días. La evaluación ocurre cuando iOS ejecuta el widget; no es un monitor continuo y el sistema puede retrasar las actualizaciones o la entrega de notificaciones.
+- **Permisos y prueba:** tras actualizar el código, ejecuta Run y elige **Probar notificación**. Permite las notificaciones de Scriptable si iOS lo solicita; si no aparece la prueba, revisa sus permisos en Ajustes. Esta acción también está disponible durante el intervalo de protección y no inicia sesión ni altera los límites de avisos reales.
+- **Persistencia:** `mitelcel_v2_alerts.json` guarda únicamente fechas, niveles y marcas de tiempo para evitar duplicados entre ejecuciones. Se conserva al cambiar la contraseña; al configurar otra línea se reinicia. No contiene números, contraseñas ni tokens. Una falla al programar un aviso no pausa la sesión ni impide mostrar el consumo; un fallo confirmado admite otro intento con datos nuevos a partir de una hora.
+- **Configuración:** `CONFIG.usageAlertsEnabled = false` desactiva avisos automáticos. `CONFIG.alertCooldownHours` permite aumentar la separación, con un mínimo de 24 horas. Los tres umbrales están en `USAGE_ALERT_RULES`. No se añade ninguna llave de Keychain.
+
+Las pruebas de la v2 simulan las respuestas de red; no certifican que Telcel acepte una cuenta concreta ni que su API privada mantenga el mismo contrato. La protección limita los intentos del nuevo script y no garantiza evitar bloqueos causados por otros clientes o por políticas del operador.
+
 ## Método 1: Instalación vía Scriptable (Recomendado, Sin Mac)
+
+**Para Telcel se recomienda el procedimiento v2 anterior.** Las instrucciones generales siguientes conservan también la instalación de la versión original.
 
 Instala y ejecuta el widget en tu iPhone directamente sin necesidad de cuenta de desarrollador ni computadora.
 
@@ -163,6 +214,7 @@ Puedes probar las llamadas reales y verificar el formato devuelto por Mi Telcel 
 │   └── widget_preview.png          # Captura del widget en pantalla de inicio
 ├── src/
 │   ├── MiTelcelWidget.js           # Widget autónomo Mi Telcel para Scriptable (iOS)
+│   ├── MiTelcelWidgetv2.js         # Telcel v2: intervalo y pausa persistente ante fallos de acceso
 │   ├── MiBaitWidget.js             # Widget autónomo Mi Bait para Scriptable (iOS)
 │   ├── MiMovistarWidget.js         # Widget autónomo Mi Movistar para Scriptable (iOS)
 │   ├── MiATTWidget.js              # Widget autónomo Mi AT&T para Scriptable (iOS)

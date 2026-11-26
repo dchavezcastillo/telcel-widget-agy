@@ -1501,6 +1501,9 @@ const testNetworkValidators = async () => {
 
 await testNetworkValidators();
 
+const { testTelcelV2 } = await import("./test_telcel_v2.mjs");
+await testTelcelV2([fixture, telcelPlanChangeFixture, telcelExhaustedPromoFixture]);
+
 // 1g. AT&T tests (Crypto, session extraction, parser, cache, network mock)
 await import("./test_att.mjs");
 
