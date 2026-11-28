@@ -21,6 +21,7 @@ export async function testTelcelV2(fixtures) {
   const originalWarn = console.warn;
   const originalPreview = ListWidget.prototype.presentSmall;
   const now = new Date("2026-11-25T18:00:00Z");
+  const refreshMs = 3 * 3600000;
   const phone = "0000000000";
   const password = "fake password + &= ñ";
   let files, keys, calls, warnings, failure, storageFailure, started;
@@ -43,6 +44,7 @@ export async function testTelcelV2(fixtures) {
     if (req.url.includes("/authorize?")) {
       if (failure === "login401") return { statusCode: 401, text: "secret body must never be logged" };
       if (failure === "login429") return { statusCode: 429, text: "locked" };
+      if (failure === "login503") return { statusCode: 503, text: "offline" };
       if (failure === "timeout") throw new Error("unsafe request URL and credentials");
       if (failure === "emptyOIDC") return { text: "<html>bot protection</html>" };
       started?.();
@@ -142,7 +144,8 @@ export async function testTelcelV2(fixtures) {
     const data = await v2.fetchTelcelData(undefined, { now });
     assert.equal(data.totalMB, 15001);
     assert.equal(state().paused, false);
-    assert.equal(state().nextAllowedAt, now.getTime() + 3600000);
+    assert.equal(v2.CONFIG.refreshMinutes, 180);
+    assert.equal(state().nextAllowedAt, now.getTime() + refreshMs);
     assert.equal(calls.filter(r => r.url.includes("/authorize?")).length, 1);
     assert.equal(calls.filter(r => r.url.endsWith("/sso/revoke")).length, 1);
     assert.equal(calls.find(r => r.url.includes("/authorize?")).headers.PASSWORD, password);
@@ -155,10 +158,12 @@ export async function testTelcelV2(fixtures) {
     const count = calls.length;
     await assert.rejects(() => v2.fetchTelcelData(undefined, { now }), e => e.code === "wait");
     assert.equal(calls.length, count);
-    await v2.fetchTelcelData(undefined, { now: new Date(now.getTime() + 3600000) });
+    await assert.rejects(() => v2.fetchTelcelData(undefined, { now: new Date(now.getTime() + refreshMs - 1) }), e => e.code === "wait");
+    assert.equal(calls.length, count);
+    await v2.fetchTelcelData(undefined, { now: new Date(now.getTime() + refreshMs) });
     assert.equal(calls.filter(r => r.url.includes("/authorize?")).length, 2);
 
-    for (const scenario of ["login401", "login429", "timeout", "emptyOIDC", "wrongState", "exchange401", "emptyB2F"]) {
+    for (const scenario of ["login401", "login429", "emptyOIDC", "wrongState", "exchange401", "emptyB2F"]) {
       reset(); failure = scenario;
       await assert.rejects(() => v2.fetchTelcelData(undefined, { now }), e => e instanceof v2.TelcelError);
       assert.equal(state().paused, true, scenario);
@@ -178,12 +183,18 @@ export async function testTelcelV2(fixtures) {
       assert.equal(state().paused, false);
     }
 
-    for (const scenario of ["home503", "homeInvalid"]) {
+    for (const scenario of ["timeout", "login503", "home503", "homeInvalid"]) {
       reset(); failure = scenario;
       await assert.rejects(() => v2.fetchTelcelData(undefined, { now }));
-      assert.equal(state().paused, false); // Fallo posterior al login: reintento espaciado.
-      assert.equal(state().nextAllowedAt, now.getTime() + 3600000);
-      assert.equal(calls.filter(r => r.url.endsWith("/sso/revoke")).length, 1);
+      assert.equal(state().paused, false); // Errores temporales no obligan a reingresar credenciales.
+      assert.equal(state().nextAllowedAt, now.getTime() + refreshMs);
+      assert.equal(calls.filter(r => r.url.endsWith("/sso/revoke")).length, scenario.startsWith("home") ? 1 : 0);
+      const beforeRetry = calls.length;
+      await assert.rejects(() => v2.fetchTelcelData(undefined, { now: new Date(now.getTime() + refreshMs - 1) }), e => e.code === "wait");
+      assert.equal(calls.length, beforeRetry);
+      failure = "";
+      await v2.fetchTelcelData(undefined, { now: new Date(now.getTime() + refreshMs) });
+      assert.equal(state().paused, false);
     }
     reset(); failure = "revoke";
     await v2.fetchTelcelData(undefined, { now });
@@ -198,10 +209,17 @@ export async function testTelcelV2(fixtures) {
     assert.equal(widget.images.find(image => image.arcs > 0).arcs, 3);
     assert(widget.refreshAfterDate instanceof Date);
     assert.equal(v2.createWidget(null).url, "scriptable://");
-    // Una lectura anticipada de caché no aplaza otros 60 minutos la consulta ya programada.
+    // Una lectura anticipada de caché no aplaza otras tres horas la consulta programada.
     const early = new Date(now.getTime() + 20 * 60000);
-    const scheduledWidget = v2.createWidget(data, { paused: false, nextAllowedAt: now.getTime() + 3600000 }, early);
-    assert.equal(scheduledWidget.refreshAfterDate.getTime(), now.getTime() + 3600000);
+    const scheduledWidget = v2.createWidget(data, { paused: false, nextAllowedAt: now.getTime() + refreshMs }, early);
+    assert.equal(scheduledWidget.refreshAfterDate.getTime(), now.getTime() + refreshMs);
+    reset();
+    for (const oldInterval of [3600000, 6 * 3600000]) {
+      v2.saveState({ version: 2, configured: true, paused: false, lastSuccessAt: now.getTime(),
+        lastAttemptAt: now.getTime(), nextAllowedAt: now.getTime() + oldInterval });
+      const migrated = v2.loadState(new Date(now.getTime() + 2 * 3600000));
+      assert.equal(migrated.nextAllowedAt, now.getTime() + refreshMs);
+    }
     files.set(path(v2.CONFIG.cacheFileName), "[1,2]");
     assert.equal(v2.loadCache(now), null);
 
@@ -230,12 +248,16 @@ export async function testTelcelV2(fixtures) {
     let formLoadGate = null;
     let hangOnLoad = false;
     let completeCount = 0;
+    let selectedMenuAction = null;
     globalThis.Script.complete = () => { completeCount++; };
     globalThis.Alert = class {
+      constructor() { this.actions = []; }
       addTextField() { throw new Error("Do not capture credentials with native Alert fields"); }
       addSecureTextField() { throw new Error("Do not capture credentials with native Alert fields"); }
-      addAction() {} addCancelAction() {}
-      async presentAlert() { return 0; }
+      addAction(title) { this.actions.push(title); } addCancelAction() {}
+      async presentAlert() {
+        return selectedMenuAction ? this.actions.indexOf(selectedMenuAction) : 0;
+      }
       // Reproduce el síntoma del dispositivo: el getter nativo devuelve vacío.
       textFieldValue() { nativeFieldReads++; return ""; }
     };
@@ -286,6 +308,49 @@ export async function testTelcelV2(fixtures) {
     keys.set("TELCEL_PASS", "old invalid password");
     await v2.main();
     assert.equal(calls.filter(r => r.url.includes("/authorize?")).length, 1);
+
+    // Varias actualizaciones en widget y dentro de la app reutilizan Keychain sin WebView.
+    const capturedForms = forms.length;
+    const savedPassword = keys.get("TELCEL_PASS");
+    const makeDue = () => {
+      const s = v2.loadState();
+      const last = Date.now() - refreshMs - 1000;
+      Object.assign(s, { paused: false, lastSuccessAt: last, lastAttemptAt: last, nextAllowedAt: last + refreshMs });
+      v2.saveState(s);
+    };
+    for (const inWidget of [true, false, true]) {
+      makeDue();
+      globalThis.config.runsInWidget = inWidget;
+      const before = calls.filter(r => r.url.includes("/authorize?")).length;
+      await v2.main();
+      assert.equal(calls.filter(r => r.url.includes("/authorize?")).length, before + 1);
+      assert.equal(calls.filter(r => r.url.includes("/authorize?")).at(-1).headers.PASSWORD, savedPassword);
+      assert.equal(forms.length, capturedForms);
+      assert(state().nextAllowedAt > Date.now() + refreshMs - 60000);
+      const after = calls.length;
+      await v2.main();
+      assert.equal(calls.length, after);
+    }
+
+    // Un rechazo se reintenta solo por acción manual, usando las llaves existentes.
+    makeDue(); failure = "login401";
+    globalThis.config.runsInWidget = true;
+    await v2.main();
+    assert.equal(state().paused, true);
+    assert.equal(keys.get("TELCEL_PASS"), savedPassword);
+    const s = v2.loadState();
+    s.nextAllowedAt = Date.now() - 1;
+    v2.saveState(s);
+    globalThis.config.runsInWidget = false;
+    selectedMenuAction = "Reintentar con credenciales guardadas";
+    failure = "";
+    const beforeResume = calls.filter(r => r.url.includes("/authorize?")).length;
+    await v2.main();
+    assert.equal(calls.filter(r => r.url.includes("/authorize?")).length, beforeResume + 1);
+    assert.equal(state().paused, false);
+    assert.equal(forms.length, capturedForms);
+    assert.equal(keys.get("TELCEL_PASS"), savedPassword);
+    selectedMenuAction = null;
     assert.equal(nativeFieldReads, 0);
     assert.equal(calls.find(r => r.url.includes("/authorize?")).headers.PASSWORD, password);
     assert.equal(state().configured, true);
@@ -293,7 +358,7 @@ export async function testTelcelV2(fixtures) {
     assert(rendered.texts.includes("Mi Telcel"));
     globalThis.config.runsInWidget = true;
     await v2.main();
-    assert.equal(calls.filter(r => r.url.includes("/authorize?")).length, 1);
+    assert.equal(calls.filter(r => r.url.includes("/authorize?")).length, beforeResume + 1);
 
     // Corregir errores en el mismo DOM, sin consultas ni pausas de acceso nuevas.
     globalThis.config.runsInWidget = false;
@@ -380,10 +445,15 @@ export async function testTelcelV2(fixtures) {
     reset(false); failure = "revoke";
     keys.set("TELCEL_PASS", "old invalid password");
     await v2.main();
-    assert.equal(keys.get("TELCEL_PASS"), "old invalid password");
+    assert.equal(keys.get("TELCEL_PASS"), password);
     assert.equal(state().paused, true);
-    assert.equal(state().configured, false);
-    assert(v2.loadCache()); // Se conserva la gráfica válida aunque no se guarde el nuevo acceso.
+    assert.equal(state().configured, true);
+    assert(v2.loadCache()); // Credenciales validadas guardadas; el cierre fallido sigue pausado.
+    const formsAfterRevokeFailure = forms.length;
+    const requestsAfterRevokeFailure = calls.length;
+    await v2.main(); // Ver la gráfica no vuelve a pedir contraseña ni salta la pausa.
+    assert.equal(forms.length, formsAfterRevokeFailure);
+    assert.equal(calls.length, requestsAfterRevokeFailure);
 
     // Transporte fetch de Node: OIDC manual y WebLogin siguen solo el salto SSO permitido.
     reset(); delete globalThis.Request;
@@ -536,7 +606,9 @@ export async function testTelcelV2(fixtures) {
     // Durante el intervalo de protección se puede probar la notificación sin otro login.
     globalThis.config.runsInWidget = false;
     const historyBeforeMenu = files.get(path(v2.CONFIG.alertStateFileName));
-    await v2.main(); // El stub selecciona la única acción: Probar notificación.
+    selectedMenuAction = "Probar notificación";
+    await v2.main();
+    selectedMenuAction = null;
     assert.equal(scheduled.at(-1).identifier, "mitelcel-v2-usage-test");
     assert.equal(calls.length, networkAfterAlert);
     assert.equal(files.get(path(v2.CONFIG.alertStateFileName)), historyBeforeMenu);

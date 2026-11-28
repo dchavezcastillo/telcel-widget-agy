@@ -3,16 +3,16 @@
 // icon-color: light-green; icon-glyph: signal;
 
 /**
- * MiTelcelWidgetv2 2.1.0 — autónomo para Scriptable, sin dependencias.
+ * MiTelcelWidgetv2 2.2.1 — autónomo para Scriptable, sin dependencias.
  * Credenciales solo en Keychain. Nunca registra respuestas, teléfonos o tokens.
  * Un login por consulta; sin fallback automático entre métodos de acceso.
  * Si falla el acceso, se pausa hasta revisión manual (también tras reiniciar).
  */
 const CONFIG = {
-  refreshMinutes: 60, // Intervalo solicitado a iOS; mínimo permitido: 15 minutos.
+  refreshMinutes: 180, // Cada 3 horas, reutilizando las credenciales del Keychain.
   authMethod: "oidc", // "oidc" o "weblogin". Cambiar manualmente, nunca alternar en bucle.
   cooldownMinutes: 30,
-  retryMinutes: 60,
+  retryMinutes: 180,
   timeoutSeconds: 8,
   usageAlertsEnabled: true,
   alertCooldownHours: 24, // Mínimo 24 h entre alertas automáticas.
@@ -36,7 +36,7 @@ const COLORS = {
   alertRed: new Color("#FF453A")
 };
 const minutes = n => n * 60000;
-const refreshInterval = () => minutes(Math.max(15, Number(CONFIG.refreshMinutes) || 60));
+const refreshInterval = () => minutes(Math.max(15, Number(CONFIG.refreshMinutes) || 180));
 const cooldownInterval = () => minutes(Math.max(30, Number(CONFIG.cooldownMinutes) || 30));
 
 class TelcelError extends Error {
@@ -89,6 +89,13 @@ function loadState(now = new Date()) {
     if (s === null) return { version: 2, configured: false, paused: false, nextAllowedAt: 0 };
     if (s.version !== 2 || typeof s.configured !== "boolean" || typeof s.paused !== "boolean"
       || !Number.isFinite(s.nextAllowedAt) || s.nextAllowedAt < 0) throw new Error();
+    // Migrar también el plazo de una versión anterior sin borrar sus credenciales.
+    if (!s.paused && s.configured && Number.isFinite(s.lastSuccessAt)) {
+      const afterSuccess = (s.lastAttemptAt || 0) <= s.lastSuccessAt;
+      const anchor = afterSuccess ? s.lastSuccessAt : s.lastAttemptAt;
+      const interval = afterSuccess ? refreshInterval() : Math.max(refreshInterval(), minutes(CONFIG.retryMinutes));
+      s.nextAllowedAt = anchor + interval;
+    }
     return s;
   } catch (_) {
     // Fallar cerrado: no iniciar sesión si el estado de protección está dañado.
@@ -198,6 +205,11 @@ function getStoredCredentials() {
     phone: Keychain.contains("TELCEL_PHONE") ? Keychain.get("TELCEL_PHONE") : "",
     password: Keychain.contains("TELCEL_PASS") ? Keychain.get("TELCEL_PASS") : ""
   };
+}
+function hasStoredCredentials() {
+  const creds = getStoredCredentials();
+  return /^\d{10}$/.test(normalizePhone(creds.phone))
+    && typeof creds.password === "string" && Boolean(creds.password.trim());
 }
 function normalizePhone(value) {
   const digits = String(value || "").replace(/\D/g, "");
@@ -429,7 +441,8 @@ async function fetchTelcelData(creds, { manual = false, now = new Date() } = {})
     const safe = err instanceof TelcelError ? err : new TelcelError("format", "Consulta");
     state = loadState(now);
     if (state.attemptId !== attemptId) throw safe;
-    const pause = state.message?.startsWith("No se confirmó") || safe.stage.startsWith("SSO")
+    const transient = safe.code === "network" || (safe.code === "http" && safe.status >= 500);
+    const pause = state.message?.startsWith("No se confirmó") || (safe.stage.startsWith("SSO") && !transient)
       || [400, 401, 403, 423, 429].includes(safe.status) || ["token", "storage"].includes(safe.code);
     if (safe.stage === "Intercambio B2F" && ([400, 401, 403].includes(safe.status) || safe.code === "token")) {
       // Un rechazo aquí puede ser configuración pública obsoleta, no contraseña incorrecta.
@@ -458,7 +471,7 @@ function credentialFormHTML() {
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'">
-<title>Mi Telcel v2.1.0</title>
+<title>Mi Telcel v2.2.1</title>
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#111;color:#fff;font:17px -apple-system,system-ui,sans-serif;padding:28px 20px}
 main{max-width:440px;margin:auto}h1{font-size:26px;margin:0 0 12px}p{color:#b8b8c0;line-height:1.45}label{display:block;font-weight:600;margin:24px 0 8px}
@@ -466,7 +479,7 @@ input{width:100%;padding:15px;border:1px solid #555;border-radius:12px;backgroun
 button{width:100%;margin-top:24px;padding:15px;border:0;border-radius:12px;background:#32d74b;color:#111;font:600 17px -apple-system,system-ui,sans-serif}
 button.secondary{margin-top:10px;background:#242428;color:#fff}#error{color:#ffd60a;min-height:24px}#ready{padding:12px 0}#ready p{color:#fff}
 </style></head><body><main>
-<h1>Configurar Mi Telcel v2.1.0</h1>
+<h1>Configurar Mi Telcel v2.2.1</h1>
 <p>Tu cuenta debe estar desbloqueada y los widgets Telcel anteriores desactivados.</p>
 <form id="form" novalidate autocomplete="off">
 <label for="phone">Número Telcel</label>
@@ -574,7 +587,8 @@ async function configureCredentials() {
   assertCredentials(creds);
   const { phone, password } = creds;
   const data = await validateTelcelCredentials(phone, password);
-  if (loadState().paused) throw new TelcelError("network", "Cierre SSO");
+  // El consumo ya validó estas credenciales y el finally ya intentó revocar.
+  // Conservarlas aunque el cierre falle; la pausa sigue impidiendo otro login.
   Keychain.set("TELCEL_PHONE", phone);
   Keychain.set("TELCEL_PASS", password);
   const updated = loadState();
@@ -595,28 +609,37 @@ async function main() {
   let message = "";
   try {
     let state = loadState();
-    if (config.runsInWidget) {
-      if (state.configured && !state.paused && Date.now() >= state.nextAllowedAt) data = await fetchTelcelData();
-    } else if (!state.configured || !getStoredCredentials().password) {
+    const stored = hasStoredCredentials();
+    // La misma consulta automática en la pantalla de inicio y al abrir el script.
+    if (state.configured && stored && !state.paused && Date.now() >= state.nextAllowedAt) {
+      data = await fetchTelcelData();
+      state = loadState();
+    }
+    if (!config.runsInWidget && (!state.configured || !stored)) {
       data = await configureCredentials();
-    } else {
+    } else if (!config.runsInWidget) {
       const alert = new Alert();
       alert.title = "Mi Telcel v2";
       const wait = Math.max(0, Math.ceil((state.nextAllowedAt - Date.now()) / 60000));
-      alert.message = `${state.message || "Actualización automática cada " + Math.round(refreshInterval() / 60000) + " minutos, según iOS."}${wait ? ` Próxima consulta permitida en ${wait} min.` : ""}`;
-      const actions = [];
+      const hours = refreshInterval() / minutes(60);
+      alert.message = `${state.message || `Actualización automática cada ${hours} horas con tus credenciales guardadas, según iOS.`}${wait ? ` Próxima consulta permitida en ${wait} min.` : ""}`;
+      alert.addAction(data ? "Ver gráfica actualizada" : "Ver gráfica guardada");
+      const actions = ["view"];
       if (!wait) {
-        if (!state.paused) { alert.addAction("Actualizar ahora"); actions.push("update"); }
-        alert.addAction(state.paused ? "Revisar credenciales y reanudar" : "Cambiar credenciales");
+        if (state.paused) {
+          alert.addAction("Reintentar con credenciales guardadas");
+          actions.push("resume");
+        }
+        alert.addAction("Cambiar credenciales");
         actions.push("configure");
       }
       if (typeof Notification !== "undefined") {
         alert.addAction("Probar notificación");
         actions.push("notification");
       }
-      alert.addCancelAction("Ver gráfica guardada");
+      alert.addCancelAction("Cerrar menú");
       const choice = actions[await alert.presentAlert()];
-      if (choice === "update") data = await fetchTelcelData();
+      if (choice === "resume") data = await fetchTelcelData(undefined, { manual: true });
       if (choice === "configure") data = await configureCredentials();
       if (choice === "notification") await sendTestUsageNotification();
     }
